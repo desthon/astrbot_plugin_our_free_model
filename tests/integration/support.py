@@ -57,7 +57,12 @@ BASELINE_SUBCOMMANDS = {
     "ofm announce",
 }
 #: Subcommands the contract adds.
-NEW_SUBCOMMANDS = {"ofm provision", "ofm unprovision"}
+NEW_SUBCOMMANDS = {
+    "ofm provision",
+    "ofm unprovision",
+    "ofm start",
+    "ofm stop",
+}
 
 
 # ---------------------------------------------------------------------------

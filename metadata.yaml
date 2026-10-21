@@ -1,6 +1,6 @@
 name: astrbot_plugin_our_free_model
 display_name: Our Free Model 接入
 desc: 零配置接入本机 Our Free Model 独立服务（127.0.0.1:18900）：装好即自动创建 AstrBot 提供商并接管空默认模型，另有模型目录、会话级模型与思考强度覆盖、体检、用量与公告，全部命令仅管理员可用。
-version: 0.3.1
+version: 0.4.0
 author: desth
 astrbot_version: ">=4.13.0,<5"

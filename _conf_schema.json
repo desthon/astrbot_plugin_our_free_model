@@ -58,5 +58,25 @@
     "description": "/ofm setup 是否打印完整 forwardKey",
     "hint": "关闭后只打印掩码；命令本身就仅管理员可用。",
     "default": true
+  },
+  "auto_start": {
+    "type": "bool",
+    "description": "自动拉起本机 OFM standalone（需要 node ^22.19 或 >=24，以及 OFM 仓库）",
+    "default": true
+  },
+  "ofm_root": {
+    "type": "string",
+    "description": "OFM 仓库路径；留空则依次找 $OFM_REPO / $OFM_HOME / ~/dsh-our-free-model / ~/our-free-model",
+    "default": ""
+  },
+  "ofm_start_port": {
+    "type": "int",
+    "description": "希望 OFM standalone 监听的端口（被占用时 OFM 会自己顺延，插件会从 settings.json 读实际端口）",
+    "default": 18900
+  },
+  "start_timeout": {
+    "type": "int",
+    "description": "拉起服务后等 /health 就绪的秒数",
+    "default": 25
   }
 }

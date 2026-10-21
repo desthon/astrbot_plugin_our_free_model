@@ -17,17 +17,25 @@
 
 ---
 
-## 1. 安装（两步）
+## 1. 安装（一步）
 
-环境要求：AstrBot `>=4.13.0,<5`，Python 3.12+。**不新增任何第三方依赖**（`httpx` 是 AstrBot 主依赖）。
+环境要求：AstrBot `>=4.13.0,<5`，Python 3.12+，**Node.js `^22.19` 或 `>=24`**（OFM standalone 是 Node 程序），
+以及本机有一份 Our Free Model 仓库。**不新增任何 Python 第三方依赖**（`httpx` 是 AstrBot 主依赖）。
 
 ```bash
-# 第 1 步：把整个目录放进 AstrBot 的插件目录，然后重启 AstrBot（或 WebUI 插件页重载）
+# 唯一的安装动作：把整目录放进 AstrBot 插件目录，然后重启 AstrBot
 cp -r astrbot_plugin_our_free_model <AstrBot 根目录>/data/plugins/
-
-# 第 2 步：起 OFM standalone（默认 127.0.0.1:18900）
-npm run start:standalone
 ```
+
+服务不用你起：插件在 `on_astrbot_loaded` 里会自己找到 OFM 仓库、拉起
+`packages/standalone/cli.mjs`、等 `/health` 就绪，然后把 provider 接上。日志里会看到：
+
+```
+[ofm] 已拉起 OFM standalone：pid=12345，http://127.0.0.1:18900
+[ofm] 自动接入完成：provider=ofm-free（新建 provider_sources 条目、新建 provider 条目、…model=combo:recommended-free）
+```
+
+然后直接聊天。想确认状态：`/ofm doctor`（看「本地服务」与「自动接入」两块）。
 
 插件目录结构：
 
@@ -37,22 +45,22 @@ npm run start:standalone
 ├── _conf_schema.json
 ├── main.py
 ├── README.md
-└── core/{__init__,endpoints,secrets,ofm_client,catalog,session,stats,feed,provision}.py
+└── core/{__init__,endpoints,secrets,ofm_client,catalog,session,stats,feed,provision,supervisor}.py
 ```
 
-AstrBot 打印 `AstrBot started` 之后，插件会自己完成接入；日志里会看到一行：
+插件会自己把这些准备好，你不需要手动做：
 
-```
-[ofm] 自动接入完成：provider=ofm-free（新建 provider_sources 条目、新建 provider 条目、接管了空的全局默认模型、model=combo:recommended-free）
-```
+1. **forwardKey**：服务首次启动时自己铸造（写在 `settings.json` 顶层），插件直接读，不用你填；
+2. **`/v1` 总闸**：`settings.json` 的 `settings.enabled`（默认 `true`）。如果它被关掉，
+   `/v1` 和 `/health` 都会 503，插件会自动 `POST /api/management/settings` 把它打开一次；
+3. **provider 与模型**：`/v1/models` 目录就绪后按固定优先级选一个，写进托管 provider。
 
-然后直接聊天即可。想确认状态：`/ofm doctor`（看「自动接入」块）→ `/ofm provision`（手动重跑一次）→ 正常对话。
+⚠️ 别把两个开关混起来（我们之前也混过，已修正）：
+`settings.enabled` 是 **standalone `/v1` 的总闸**；`settings.forward.enabled` 是 **18899 那个独立转发进程**
+（插件模式才用），standalone 形态下与 `/v1` 无关。
 
-前置条件（很重要，缺一样都会 503/401）：
-
-1. OFM 独立服务在跑：`npm run start:standalone`（默认 `127.0.0.1:18900`，只监听回环）；
-2. OFM 里 **设置 → 本地转发** 已打开并保存——否则除 `/health` 外一律 503；
-3. 打开转发之后 `settings.json` 才会出现顶层 `forwardKey`（惰性铸造），插件自动读它。
+手工兜底仍然可用：想自己起服务就 `npm run start:standalone`，
+插件检测到已经在跑就只**接管**、不会重复拉起。
 
 如果 OFM 的数据目录不在默认位置（`$OFM_HOME` 或 `~/.our-free-model`），启动 AstrBot 时把 `OFM_HOME` 指过去：
 
@@ -62,7 +70,29 @@ OFM_HOME=/srv/our-free-model python3 main.py   # 或写进 systemd service 的 E
 
 ---
 
-## 2. 它改了什么配置（零配置的代价）
+## 2. 插件怎么拉起本地服务
+
+`on_astrbot_loaded` 里先 `_ensure_service()`，再 `_ensure_provisioned()`。服务这一层的规则：
+
+| 情况 | 插件的行为 |
+|---|---|
+| `/health` 通 | **接管**，不重复拉起（你手动起的服务也一样） |
+| 端口在监听但 `/health` 503 | 判定为「服务在跑、总闸被关」，去 `POST /api/management/settings {"enabled": true}` 打开 |
+| 没在跑 | 用 `node packages/standalone/cli.mjs --port 18900` 拉起，等 `/health`（默认最多 25 秒） |
+| 数据目录已有 `service.lock` | 不重复起，按「在跑」接管 |
+| 找不到仓库 / node 版本不符 | 不改任何配置，`/ofm doctor` 里给出中文原因与下一步 |
+
+它**不会**做的事（都是刻意的）：
+
+* 不 `git clone`、不 `npm install`：standalone 运行期没有第三方依赖，但仓库得你先放好；
+* 不杀你手动起的服务：只有插件自己拉起的 PID 才会被 `/ofm stop` 或插件卸载时停掉；
+* 不抢端口：18900 被占用时交给 OFM 自己顺延，插件从 `settings.json` 的 `standalonePort` 读实际端口。
+
+仓库的位置按顺序找：配置 `ofm_root` → `$OFM_REPO` / `$OFM_ROOT` / `$OUR_FREE_MODEL_REPO` →
+`~/dsh-our-free-model` → `~/our-free-model` → `~/.our-free-model/repo` → `/opt/dsh-our-free-model`。
+判定标准只有一个：里面有没有 `packages/standalone/cli.mjs`。
+
+## 3. 它改了什么配置（零配置的代价）
 
 自动接入只碰 AstrBot 默认配置文件 `<AstrBot 根目录>/data/cmd_config.json`（内存里是
 `provider_manager.acm.default_conf`，插件通过 `save_config_async()` 落盘）里的**三处**，别的地方一行都不动：
@@ -90,7 +120,7 @@ OFM_HOME=/srv/our-free-model python3 main.py   # 或写进 systemd service 的 E
 
 ---
 
-## 3. OFM 后启动怎么办
+## 4. OFM 后启动怎么办
 
 AstrBot 先起来、OFM 后起来是常见顺序（尤其 systemd 里两个服务）。这不算故障：
 
@@ -122,7 +152,7 @@ AstrBot 先起来、OFM 后起来是常见顺序（尤其 systemd 里两个服�
 
 ---
 
-## 4. 配置项（WebUI → 插件 → 配置）
+## 5. 配置项（WebUI → 插件 → 配置）
 
 | 键 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
@@ -133,6 +163,10 @@ AstrBot 先起来、OFM 后起来是常见顺序（尤其 systemd 里两个服�
 | `diagnose_timeout` | int | 3 | 端点探测 / health 检查的单次超时 |
 | `models_ttl` | int | 600 | 模型目录缓存（秒） |
 | `stats_ttl` | int | 60 | 用量缓存（秒） |
+| `auto_start` | bool | `true` | 自动拉起本机 OFM standalone。关掉后插件只做接入、不再拉进程（`/ofm start` 仍可手动拉一次） |
+| `ofm_root` | string | 空 | OFM 仓库路径；空则按 `$OFM_REPO` → `~/dsh-our-free-model` … 依次找 |
+| `ofm_start_port` | int | `18900` | 希望监听的端口；被占用时 OFM 自己顺延，插件从 `settings.json` 读实际值 |
+| `start_timeout` | int | `25` | 拉起后等 `/health` 就绪的秒数 |
 | `default_model` | string | `combo:recommended-free` | 托管 provider `ofm-free` 使用的模型；目录读不到时 `/ofm setup` 也拿它兜底 |
 | `models_page_limit` | int | 30 | `/ofm models` 一屏最多列出的条数 |
 | `announce_limit` | int | 3 | `/ofm announce` 默认条数（上限 10） |
@@ -142,7 +176,7 @@ AstrBot 先起来、OFM 后起来是常见顺序（尤其 systemd 里两个服�
 
 ---
 
-## 5. 手工兜底：自己建一个提供商（正常情况下不需要）
+## 6. 手工兜底：自己建一个提供商（正常情况下不需要）
 
 自动接入能跑通就不用看这一节。只在下面这些情况下才需要手工建：`auto_provision` 被关掉了、
 宿主版本不兼容（拿不到 `ProviderManager`、`/ofm doctor` 的「自动接入」块报 ✘）、或者你就是要自己管理提供商。
@@ -177,7 +211,7 @@ Key：ofm-9f2c1a7b3d5e4f60
 
 ---
 
-## 6. 命令参考（全部仅管理员）
+## 7. 命令参考（全部仅管理员）
 
 命令组前缀 `/ofm`。所有命令都带 `PermissionType.ADMIN`，非管理员不会看到任何回执。
 
@@ -312,6 +346,17 @@ tokens：输入 1.82M / 输出 402.5K（按样本合计，不是全量）
 
 管理 API 不可用（插件网关模式 / 跨机）时自动回落 `stats.json`，来源行显示 `本地 stats.json（samples 最多 400 条环形）`。
 
+### `/ofm start`
+
+手动拉起本地 OFM standalone（已在跑则只接管，不会起第二个）。失败时直接给排查顺序，
+并把进程最后几行输出贴出来（`service.lock` 冲突、node 版本、仓库路径都在这里能看出来）。
+
+### `/ofm stop`
+
+停掉**由本插件拉起**的 OFM standalone，并清掉 PID 记录。你手动起的服务插件不会去杀，
+这条命令会明确告诉你「没有由插件拉起的服务可停」。停掉后托管 provider 配置仍在，
+对话会失败，恢复用 `/ofm start`。
+
 ### `/ofm provision`
 
 手动重跑一次自动接入（`auto_provision` 关着也照跑）。回复里写清楚新建 / 更新了什么、默认模型有没有被接管、失败时降级原因：
@@ -352,7 +397,7 @@ tokens：输入 1.82M / 输出 402.5K（按样本合计，不是全量）
 
 ---
 
-## 7. 请求覆盖是怎么生效的
+## 8. 请求覆盖是怎么生效的
 
 `on_llm_request` 钩子读本会话的 `{model, effort}`，**只在有覆盖时**改写 `req.model`：
 
@@ -366,7 +411,7 @@ req.model = "combo:recommended-free(deep)"   # 尾缀形式
 
 ---
 
-## 8. 限额与已知限制
+## 9. 限额与已知限制
 
 1. **渠道全是推断**。`/v1/models` 只有 `id/object/created/owned_by/context_window/x_ofm_efforts/x_ofm_effort_default`，没有 name、vision、channel 字段。插件按 id 形态猜：`*-free`→免费道、`combo:`→降级链、`kilo-auto/…`→Kilo、含 `/` 的 `<provider>/<model>`→聚合渠道（EAC 也是 `<org>/<model>`，**无法与聚合严格区分**，所以一律归聚合，不单列 `eac`）、其余→未分类。这只是展示分类，不代表服务端真实标记。
 2. **`created` 是每次请求现算的** `Date.now()`，插件从不拿它当缓存键（缓存键是 `base_url`）。
@@ -376,13 +421,19 @@ req.model = "combo:recommended-free(deep)"   # 尾缀形式
 6. **不做区域判断**。region-limited 模型和普通模型混在同一个数组里且无标记，能不能用只以实际请求的 `404 model "X" not found` / `Model is unavailable` 为准。
 7. **非法档位 OFM 不报错**。它静默回落默认档，所以插件侧按 `x_ofm_efforts` 强校验；`x_ofm_efforts` 为空的模型一律拒绝 `--effort`（设了也不会生效）。
 8. **不做后台轮询**：不推送公告、不主动探活。唯一的后台动作是自动接入自愈的重试任务（`asyncio.create_task`，
-   300 秒一次、最多 3 次、只在有对话时触发），其余网络动作都由一条命令或一轮对话触发。
-9. **不写任何 OFM 数据**：`settings.json` / `stats.json` / `feed.json` 只读；`stats.json` 的版本迁移由 OFM 自己负责。
-10. 模型目录缓存 `models_ttl`（默认 600 秒）。改过 OFM 配置后想立刻看到新目录，重启插件或等缓存过期。
+   300 秒一次、最多 3 次，用尽后降到 30 分钟一次，只在有对话时触发），其余网络动作都由一条命令或一轮对话触发。
+9. **对 OFM 数据目录的写只有一处**：`/v1` 总闸被关掉时，插件会 `POST /api/management/settings {"enabled": true}`
+   打开它（这是唯一的写操作，且是你关掉之后才会发生）。`stats.json` / `feed.json` 始终只读。
+   托管 provider 的 `api_base`/`key`/`model` 从 `settings.json` 读，不写回。
+10. **需要本机有 node 与 OFM 仓库**：插件负责起进程，不负责装 Node、不 `git clone`、不 `npm install`
+   （standalone 运行期零第三方依赖，所以不需要安装依赖）。找不到时只降级，不改配置，`/ofm doctor` 说明原因。
+11. **只停自己拉起的进程**：PID 记在 KV 里（`owned=true`）。你手动 `npm run start:standalone` 起的服务，
+   `/ofm stop` 不会碰，插件卸载时也不会停。
+12. 模型目录缓存 `models_ttl`（默认 600 秒）。改过 OFM 配置后想立刻看到新目录，重启插件或等缓存过期。
 
 ---
 
-## 9. 故障排查
+## 10. 故障排查
 
 | 现象 | 原因 | 处理 |
 | --- | --- | --- |
@@ -396,6 +447,9 @@ req.model = "combo:recommended-free(deep)"   # 尾缀形式
 | 对话里模型没变成你选的那个 | 会话覆盖没生效 / 别的会话 | `/ofm status` 看「本会话覆盖」；覆盖按 `unified_msg_origin` 隔离，群聊与私聊互不影响 |
 | `/ofm doctor` 的「自动接入」块全 ✘ | 拿不到 `ProviderManager`（宿主版本不兼容）或 `auto_provision` 关着 | 升级 AstrBot 到 `>=4.13.0,<5`；或打开 `auto_provision`；或按第 5 节手工建提供商 |
 | 日志 `[ofm] 自动接入未完成：…` | OFM 还没起来 / 还没打开本地转发（没有 forwardKey）/ 端口漂移 | OFM 起来后等下一轮对话自愈（300 秒一次），或直接 `/ofm provision` |
+| 日志说 `没能启动 OFM standalone：没找到 node` / `node 版本不满足` | `node -v` 看版本；OFM 要 `^22.19` 或 `>=24` |
+| 日志说 `没找到 Our Free Model 仓库` | 把仓库放到 `~/dsh-our-free-model`，或配 `ofm_root` / 环境变量 `OFM_REPO` |
+| `/ofm doctor` 里「独立服务开关」是 ✘ | `/v1` 会被 503；重跑 `/ofm provision` 让插件打开它，或在 OFM 设置里勾上 |
 | 想把插件装的入口全清掉 | 换 provider / 迁机器 | `/ofm unprovision`（会同时把 `auto_provision` 关掉并落盘，重启不会自己装回来） |
 | 插件加载失败 | Python 版本或 AstrBot 版本不满足 | 需要 Python 3.12+、AstrBot `>=4.13.0,<5` |
 

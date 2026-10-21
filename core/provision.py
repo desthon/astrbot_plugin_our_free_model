@@ -68,6 +68,7 @@ _PROBE_TIMEOUT = 3.0
 
 #: 目录接口（OpenAI 兼容）
 _CATALOG_PATH = "/v1/models"
+_MANAGEMENT_SETTINGS_PATH = "/api/management/settings"
 
 #: 首选组合名：用户通常自建组合，默认目录里往往没有它，所以要校验而不是写死
 RECOMMENDED_MODEL = DEFAULT_MODEL
@@ -311,6 +312,36 @@ async def _gateway_reachable(client: httpx.AsyncClient, base_url: str) -> bool:
 # ---------------------------------------------------------------------------
 # 模型目录：模型名必须真的在网关目录里，否则首条对话 404
 # ---------------------------------------------------------------------------
+async def enable_standalone_api(client: httpx.AsyncClient, base_url: str, api_key: str) -> bool:
+    """把 OFM 的 ``enabled`` 打开（``/v1`` 的总闸，默认开，用户可能手动关掉）。
+
+    ``settings.json`` 里的 ``forward.enabled`` 是 18899 那个独立转发进程的开关，
+    与 standalone 的 ``/v1`` 无关——这两个字段曾被混为一谈，别再混了。
+    """
+    if not base_url or not api_key:
+        return False
+    try:
+        response = await client.post(
+            f"{base_url}{_MANAGEMENT_SETTINGS_PATH}",
+            headers={
+                "Accept": "application/json",
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={"enabled": True},
+        )
+    except Exception:
+        return False
+    if response.status_code != 200:
+        return False
+    try:
+        payload = response.json()
+    except ValueError:
+        return False
+    settings = payload.get("settings") if isinstance(payload, dict) else None
+    return isinstance(settings, dict) and settings.get("enabled") is True
+
+
 async def _fetch_catalog(client: httpx.AsyncClient, base_url: str, api_key: str) -> list[str] | None:
     """``GET /v1/models`` 的 id 列表；拿不到（老网关 / 接口异常 / 空目录）返回 ``None``。"""
     if not base_url:
@@ -502,6 +533,7 @@ async def ensure(
     """
 
     configured = _model_name(plugin, model)
+    healed_enabled = False
     flags: dict[str, Any] = {
         "ok": False,
         "provider_id": MANAGED_PROVIDER_ID,
@@ -544,12 +576,19 @@ async def ensure(
                 return ProvisionResult(**flags)
 
             catalog = await _fetch_catalog(client, base_url, api_key)
+            if catalog is None and await enable_standalone_api(client, base_url, api_key):
+                # 用户把 OFM 的「独立服务」总开关关掉了：/v1 会 503，这里替它打开一次
+                catalog = await _fetch_catalog(client, base_url, api_key)
+                healed_enabled = True
 
         existing_entry = _find_by_id(conf.get("provider"), MANAGED_PROVIDER_ID)
         existing_model = str(existing_entry.get("model") or "") if isinstance(existing_entry, dict) else ""
         chosen, model_source, note = _resolve_model(configured, catalog, existing_model)
         flags["model"] = chosen
         flags["model_source"] = model_source
+        if healed_enabled:
+            suffix = "已自动打开 OFM 的独立服务开关（settings.enabled）"
+            note = f"{note}；{suffix}" if note else suffix
         flags["note"] = note
 
         desired_source = _source_config(endpoint, _timeout_value(plugin))

@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import functools
 import time
 from datetime import datetime
@@ -30,6 +31,7 @@ from .core import catalog
 from .core import feed as feed_mod
 from .core import provision
 from .core import secrets
+from .core import supervisor
 from .core import stats as stats_mod
 from .core.provision import MANAGED_PROVIDER_ID, ProvisionResult
 from .core.endpoints import Endpoint, EndpointNotFound, resolve
@@ -186,14 +188,38 @@ class OurFreeModel(Star):
         self._provision_failures: int = 0
         self._provision_at: float = 0.0
         self._provision_task: asyncio.Task | None = None
+        self._service_last: supervisor.StartResult | None = None
+        self._service_pid: int = 0
+        self._api_reopened: bool = False
+        # (loop, lock)：AstrBot 的生命周期里 loop 稳定，但测试/重载会换 loop，
+        # 跨 loop 复用同一把 asyncio.Lock 会抛 RuntimeError，所以按 loop 重建。
+        self._service_guard: tuple[Any, asyncio.Lock] | None = None
 
     # ---- 生命周期 ---------------------------------------------------------
     async def terminate(self) -> None:
-        """插件卸载 / 重载时关掉连接池、取消还在跑的自愈任务。"""
+        """插件卸载 / 重载时关掉连接池、取消自愈任务、停掉自己拉起的本地服务。"""
         task, self._provision_task = self._provision_task, None
         if task is not None and not task.done():
             task.cancel()
         await self._drop_client()
+        await self._stop_owned_service()
+
+    async def _stop_owned_service(self) -> bool:
+        """只停「本插件拉起的」那个进程；用户手动起的服务一律不动。"""
+        record = await self._kv_get(supervisor.KV_SERVICE, None)
+        owned = isinstance(record, dict) and bool(record.get("owned"))
+        pid = self._service_pid or (int(record.get("pid") or 0) if owned else 0)
+        if not owned or not pid:
+            return False
+        stopped = await supervisor.stop(pid)
+        self._service_pid = 0
+        await self._kv_put(supervisor.KV_SERVICE, None)
+        log = getattr(self, "logger", logger)
+        if stopped:
+            log.info(f"[ofm] 已停止由插件拉起的 OFM standalone（pid={pid}）")
+        else:
+            log.warning(f"[ofm] 停止 OFM standalone 失败（pid={pid} 可能已退出）")
+        return stopped
 
     # ---- 内部：配置、端点、发送 -------------------------------------------
     def _cfg(self, name: str, default: Any) -> Any:
@@ -317,6 +343,120 @@ class OurFreeModel(Star):
             log.warning(f"[ofm] 写回 auto_provision 失败（已忽略）：{exc}")
             return f"写回 auto_provision 失败：{exc}（本次会话内仍然按你的操作生效）"
 
+    def _auto_start(self) -> bool:
+        """``auto_start`` 开关：装好即用，默认开。"""
+        value = self._cfg("auto_start", True)
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on")
+        return bool(value)
+
+    async def _reopen_api_if_disabled(self) -> bool:
+        """``settings.enabled=false`` 会让 ``/v1`` 一律 503、连端点解析都过不去。
+
+        这里按数据目录里的 ``standalonePort`` + ``forwardKey`` 把总闸打开一次；
+        打不开就算了（不是致命错误，后面照常降级）。
+        """
+        import httpx
+
+        dirs = secrets.data_dirs()
+        for candidate in dirs:
+            settings = secrets.read_settings(candidate)
+            if not settings:
+                continue
+            port = secrets.standalone_port(settings)
+            key = secrets.forward_key(candidate)
+            if not port or not key:
+                continue
+            base_url = f"http://127.0.0.1:{port}"
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    if await provision.enable_standalone_api(client, base_url, key):
+                        self._api_reopened = True
+                        log = getattr(self, "logger", logger)
+                        log.info(f"[ofm] 检测到 OFM 的独立服务开关是关的，已自动打开（{base_url}）")
+                        return True
+            except Exception:
+                continue
+        return False
+
+    async def _ensure_service(self) -> supervisor.StartResult | None:
+        """确保本机 OFM standalone 在跑：已在跑就接管，没跑且允许就由插件拉起。
+
+        整段都在锁里跑：启动钩子与消息侧自愈可能同时进来，不能拉起两个进程。
+        """
+        if not self._auto_start():
+            self._service_last = supervisor.StartResult(
+                ok=False,
+                reason="自动启动已关闭（配置 auto_start=false）：请自己起 OFM standalone",
+            )
+            return self._service_last
+        guard = self._current_service_lock()
+        if guard is None:
+            return await self._ensure_service_locked()
+        async with guard:
+            return await self._ensure_service_locked()
+
+    def _current_service_lock(self) -> asyncio.Lock | None:
+        """当前事件循环上的互斥锁（loop 变了就换一把新的）。"""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return None
+        held = self._service_guard
+        if held is None or held[0] is not loop:
+            held = (loop, asyncio.Lock())
+            self._service_guard = held
+        return held[1]
+
+    async def _ensure_service_locked(self) -> supervisor.StartResult | None:
+        repo = supervisor.find_repo(str(self._cfg("ofm_root", "") or ""))
+        if repo is None:
+            self._service_last = supervisor.StartResult(
+                ok=False,
+                reason=(
+                    "没找到 Our Free Model 仓库：把仓库放到 ~/dsh-our-free-model，"
+                    "或在插件配置 ofm_root 里填路径，或设置环境变量 OFM_REPO"
+                ),
+            )
+            return self._service_last
+        dirs = secrets.data_dirs()
+        data_dir = str(dirs[0]) if dirs else ""
+        try:
+            port = int(self._cfg("ofm_start_port", supervisor.DEFAULT_START_PORT) or 0)
+        except (TypeError, ValueError):
+            port = supervisor.DEFAULT_START_PORT
+        try:
+            wait = float(self._cfg("start_timeout", 25) or 25)
+        except (TypeError, ValueError):
+            wait = 25.0
+
+        result = await supervisor.start(
+            repo,
+            port=port or supervisor.DEFAULT_START_PORT,
+            data_dir="",
+            resolve_data_dir=data_dir,
+            wait=wait,
+        )
+        self._service_last = result
+        log = getattr(self, "logger", logger)
+        if result.ok and result.started:
+            self._service_pid = result.pid
+            await self._kv_put(
+                supervisor.KV_SERVICE,
+                {
+                    "pid": result.pid,
+                    "owned": True,
+                    "base_url": result.base_url,
+                    "started_at": int(time.time()),
+                },
+            )
+            # 服务刚起来，端点缓存必须作废，否则还会拿到旧的 404
+            await self._drop_client()
+            log.info(f"[ofm] 已拉起 OFM standalone：pid={result.pid}，{result.base_url}")
+        elif not result.ok:
+            log.warning(f"[ofm] 启动 OFM standalone 失败：{result.reason}")
+        return result
+
     def _managed_model(self) -> str:
         """托管 provider 用的模型名（复用 ``default_model``）。"""
         text = str(self._cfg("default_model", provision.DEFAULT_MODEL) or "").strip()
@@ -384,6 +524,7 @@ class OurFreeModel(Star):
         endpoint: Endpoint | None = None,
         model: str = "",
         model_source: str = "",
+        note: str = "",
     ) -> None:
         """把接入结果写进 KV。``checked_at`` 是端点复检的节流依据（跨重启有效）。"""
         previous = self._provision_last if isinstance(self._provision_last, dict) else {}
@@ -403,6 +544,8 @@ class OurFreeModel(Star):
         source = model_source or str(previous.get("model_source") or "")
         if source:
             payload["model_source"] = source
+        if note:
+            payload["note"] = _one_line(note, 200)
         self._provision_last = payload
         await self._kv_put(_PROVISION_KV, payload)
 
@@ -445,9 +588,21 @@ class OurFreeModel(Star):
             )
             return None
         except EndpointNotFound as exc:
-            self._provision_failures += 1
-            await self._remember_provision(False, exc.diagnostic)
-            return None
+            # 端点没了有两种常见原因：服务没起，或服务起了但 /v1 总闸被关掉。
+            # 先把服务拉起来，再把总闸打开，最后重新解析一次。
+            service = await self._ensure_service()
+            if service is not None and service.ok:
+                await self._reopen_api_if_disabled()
+                try:
+                    endpoint = await self._resolve_endpoint()
+                except Exception:
+                    self._provision_failures += 1
+                    await self._remember_provision(False, exc.diagnostic)
+                    return None
+            else:
+                self._provision_failures += 1
+                await self._remember_provision(False, exc.diagnostic)
+                return None
         except Exception as exc:  # 端点解析层不该出现别的异常，出现也降级
             self._provision_failures += 1
             await self._remember_provision(False, f"解析 OFM 端点失败：{exc}")
@@ -458,12 +613,18 @@ class OurFreeModel(Star):
             self._provision_failures = 0
         else:
             self._provision_failures += 1
+        if self._api_reopened and "独立服务开关" not in (result.note or ""):
+            healed = "已自动打开 OFM 的独立服务开关"
+            merged = f"{result.note}；{healed}" if result.note else healed
+            # ProvisionResult 是 frozen dataclass：换一个实例，不就地改
+            result = dataclasses.replace(result, note=merged)
         await self._remember_provision(
             result.ok,
             self._describe_provision(result),
             endpoint=endpoint,
             model=result.model,
             model_source=result.model_source,
+            note=result.note,
         )
         return result
 
@@ -921,27 +1082,79 @@ class OurFreeModel(Star):
             )
 
         port = secrets.standalone_port(settings) if settings else secrets.DEFAULT_STANDALONE_PORT
-        forward = secrets.forward_settings(settings) if settings else {}
-        enabled = forward.get("enabled")
         lines.append(mark(True, "独立服务端口", f"{port}（settings.standalonePort）"))
-        if enabled is True:
-            lines.append(mark(True, "本地转发", f"已开启（forward.port={forward.get('port', port)}）"))
-        elif enabled is None:
+        # /v1 的闸门是顶层 settings.enabled（默认 true）；forward.enabled 是 18899 那个
+        # 独立转发进程的开关，standalone 形态下与 /v1 无关。两者别再混。
+        api_enabled = settings.get("enabled") if settings else True
+        lines.append(
+            mark(
+                api_enabled is not False,
+                "独立服务开关",
+                "开（默认）" if api_enabled is not False else "关（/v1 会一律 503）",
+                "打开它：OFM 设置里勾上「独立服务」，或重跑 /ofm provision"
+                + '（插件会自动打开）；也可以 POST /api/management/settings 带 {"enabled": true}。',
+            )
+        )
+        forward = secrets.forward_settings(settings) if settings else {}
+        forward_on = forward.get("enabled") is True
+        lines.append(
+            mark(
+                True,
+                "18899 转发",
+                f"{'开' if forward_on else '关'}（settings.forward.enabled，插件模式才用）",
+                "",
+            )
+        )
+
+        # 本地服务（OFM standalone 进程）：不依赖网络，能看就能诊断
+        node_bin = supervisor.which_node()
+        version, raw_version = await supervisor.node_version(node_bin)
+        repo = supervisor.find_repo(str(self._cfg("ofm_root", "") or ""))
+        record = await self._kv_get(supervisor.KV_SERVICE, None)
+        owned = isinstance(record, dict) and bool(record.get("owned"))
+        pid = int(record.get("pid") or 0) if owned else 0
+        lines.append("")
+        lines.append("本地服务（OFM standalone）：")
+        lines.append(
+            mark(
+                self._auto_start(),
+                "auto_start",
+                "开" if self._auto_start() else "关",
+                "关掉后插件不再拉进程；/ofm start 仍可手动拉一次。",
+            )
+        )
+        lines.append(
+            mark(
+                bool(node_bin) and supervisor.version_ok(version),
+                "node",
+                raw_version or "没找到 node",
+                "需要 ^22.19 或 >=24：OFM standalone 是 Node 程序。",
+            )
+        )
+        lines.append(
+            mark(
+                repo is not None,
+                "OFM 仓库",
+                str(repo) if repo is not None else "没找到（配置 ofm_root 或环境变量 OFM_REPO）",
+                "仓库里要有 packages/standalone/cli.mjs。",
+            )
+        )
+        if owned and pid:
             lines.append(
                 mark(
-                    False,
-                    "本地转发",
-                    "settings.json 里没有 forward 段（默认关闭）",
-                    "OFM → 设置 → 本地转发 打开并保存；否则非 /health 请求一律 503。",
+                    supervisor.pid_alive(pid),
+                    "由插件拉起的进程",
+                    f"pid={pid}" + ("（存活）" if supervisor.pid_alive(pid) else "（已退出）"),
+                    "停止它用 /ofm stop（只动插件自己起的进程）。",
                 )
             )
         else:
             lines.append(
                 mark(
-                    False,
-                    "本地转发",
-                    "未开启（非 /health 请求会 503）",
-                    "OFM → 设置 → 本地转发 打开并保存，再重试。",
+                    True,
+                    "由插件拉起的进程",
+                    "无（服务要么没起，要么是你手动起的）",
+                    "手动起的服务插件不会去停。",
                 )
             )
 
@@ -1288,6 +1501,71 @@ class OurFreeModel(Star):
             lines.append("  → 修完重跑 /ofm provision；要看全貌用 /ofm doctor。")
         await self._send(event, "\n".join(lines))
 
+    # ---- /ofm start -------------------------------------------------------
+    @ofm.command("start")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @_friendly
+    async def ofm_start(self, event: AstrMessageEvent):
+        """拉起本机 OFM standalone（已在跑则只接管，不重复启动）。"""
+        result = await self._ensure_service()
+        if result is None:
+            await self._send(
+                event,
+                "自动启动已关闭（配置 auto_start=false）：请自己起 OFM standalone，"
+                "或把 auto_start 打开后重试 /ofm start。",
+            )
+            return
+        if not result.ok:
+            lines = [f"没能启动 OFM standalone：{result.reason}", "", "排查顺序："]
+            lines.append("· node 版本要满足 ^22.19 或 >=24（node -v 看一眼）")
+            lines.append("· OFM 仓库要能定位：默认找 ~/dsh-our-free-model，或配置 ofm_root / 环境变量 OFM_REPO")
+            lines.append("· 同一数据目录只能有一个实例（service.lock），先确认没有别处在跑")
+            if result.log_tail:
+                lines.append("")
+                lines.append("进程最后几行输出：")
+                lines.extend(f"  {row}" for row in result.log_tail.splitlines()[-6:])
+            await self._send(event, "\n".join(lines))
+            return
+        if result.adopted:
+            await self._send(
+                event,
+                f"OFM standalone 本来就在跑，直接接管：{result.base_url}（没有重复启动）。",
+            )
+            return
+        await self._send(
+            event,
+            f"已启动 OFM standalone：pid={result.pid}，{result.base_url}\n"
+            "下一步：/ofm provision 立即接入，或直接对话（消息侧自愈也会补上）。",
+        )
+
+    # ---- /ofm stop --------------------------------------------------------
+    @ofm.command("stop")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @_friendly
+    async def ofm_stop(self, event: AstrMessageEvent):
+        """停掉由本插件拉起的 OFM standalone；用户手动起的服务不动。"""
+        record = await self._kv_get(supervisor.KV_SERVICE, None)
+        owned = isinstance(record, dict) and bool(record.get("owned"))
+        if not owned and not self._service_pid:
+            await self._send(
+                event,
+                "没有由本插件拉起的服务可停。\n"
+                "如果端口上确实有服务在跑，那是你手动起的：请在你自己的终端里停它，"
+                "插件不会去杀不属于自己的进程。",
+            )
+            return
+        pid = self._service_pid or int(record.get("pid") or 0)
+        stopped = await self._stop_owned_service()
+        if stopped:
+            await self._send(
+                event,
+                f"已停止由插件拉起的 OFM standalone（pid={pid}）。\n"
+                "注意：托管 provider 配置还在，服务停着的时候对话会失败；"
+                "要立刻恢复就 /ofm start。",
+            )
+        else:
+            await self._send(event, f"停止失败：pid={pid} 可能已经退出。已清掉记录，/ofm start 可重来。")
+
     # ---- /ofm unprovision -------------------------------------------------
     @ofm.command("unprovision")
     @filter.permission_type(filter.PermissionType.ADMIN)
@@ -1392,6 +1670,8 @@ class OurFreeModel(Star):
                 log = getattr(self, "logger", logger)
                 log.info("[ofm] 自动接入已关闭（配置 auto_provision=false），只保留命令。")
                 return
+            # 先确保本机 OFM standalone 在跑：没跑就由插件拉起，再谈接入
+            await self._ensure_service()
             result = await self._ensure_provisioned()
             log = getattr(self, "logger", logger)
             if result is not None and result.ok:
