@@ -1,0 +1,56 @@
+{
+  "base_url": {
+    "type": "string",
+    "description": "手动指定 OFM 网关地址（留空 = 自动发现 standalone 端口）",
+    "hint": "形如 http://127.0.0.1:18900，不要带 /v1；留空时插件会读 settings.json 的 standalonePort 并扫描相邻端口。",
+    "default": ""
+  },
+  "api_key": {
+    "type": "string",
+    "description": "手动覆盖 forwardKey（留空 = 读 settings.json 的 forwardKey）",
+    "hint": "注意：secret 只做界面遮罩，不加密落盘。",
+    "default": "",
+    "secret": true
+  },
+  "request_timeout": {
+    "type": "int",
+    "description": "访问 OFM 的超时（秒）",
+    "default": 120
+  },
+  "diagnose_timeout": {
+    "type": "int",
+    "description": "端点探测 / health 检查的单次超时（秒）",
+    "default": 3
+  },
+  "models_ttl": {
+    "type": "int",
+    "description": "模型目录缓存时间（秒）",
+    "default": 600
+  },
+  "stats_ttl": {
+    "type": "int",
+    "description": "用量统计缓存时间（秒）",
+    "default": 60
+  },
+  "default_model": {
+    "type": "string",
+    "description": "目录为空时 /ofm setup 兜底使用的模型名",
+    "default": "combo:recommended-free"
+  },
+  "models_page_limit": {
+    "type": "int",
+    "description": "/ofm models 一屏最多列出的条数",
+    "default": 30
+  },
+  "announce_limit": {
+    "type": "int",
+    "description": "/ofm announce 默认显示的公告条数（上限 10）",
+    "default": 3
+  },
+  "show_api_key_in_setup": {
+    "type": "bool",
+    "description": "/ofm setup 是否打印完整 forwardKey",
+    "hint": "关闭后只打印掩码；命令本身就仅管理员可用。",
+    "default": true
+  }
+}
