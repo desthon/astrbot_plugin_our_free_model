@@ -1,4 +1,10 @@
 {
+  "auto_provision": {
+    "type": "bool",
+    "description": "装好即自动接入 OFM（关掉则只保留命令，需手工在 WebUI 建提供商）",
+    "hint": "开：AstrBot 启动后自动创建 provider_sources[ofm-standalone] 与 provider[ofm-free]，并在全局默认模型为空时接管成 ofm-free；关：插件不碰配置，只用 /ofm 命令与请求覆盖。",
+    "default": true
+  },
   "base_url": {
     "type": "string",
     "description": "手动指定 OFM 网关地址（留空 = 自动发现 standalone 端口）",
@@ -34,7 +40,7 @@
   },
   "default_model": {
     "type": "string",
-    "description": "目录为空时 /ofm setup 兜底使用的模型名",
+    "description": "托管 provider（ofm-free）使用的模型；目录读不到时 /ofm setup 也拿它兜底",
     "default": "combo:recommended-free"
   },
   "models_page_limit": {
