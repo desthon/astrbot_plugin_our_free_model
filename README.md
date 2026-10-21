@@ -19,8 +19,21 @@
 
 ## 1. 安装（一步）
 
-环境要求：AstrBot `>=4.13.0,<5`，Python 3.12+，**Node.js `^22.19` 或 `>=24`**（OFM standalone 是 Node 程序），
+环境要求：AstrBot `>=4.13.0,<5`，Python 3.12+，**Node.js `>=20.19`**（OFM standalone 是 Node 程序），
 以及本机有一份 Our Free Model 仓库。**不新增任何 Python 第三方依赖**（`httpx` 是 AstrBot 主依赖）。
+
+> **Node 20 需要先打一个补丁。** 上游 `engines` 写的是 `^22.19 || >=24`，但实测 Node 20 只卡在
+> 一处 API：`node:worker_threads` 的 `markAsUncloneable` 是 Node 22.10 才有的导出，内置渠道包里
+> 的 undici 把它装进 `webidl.util` 后一调用就抛 `webidl.util.markAsUncloneable is not a function`。
+> AstrBot 的装机脚本给到的正是 20.x，所以仓库里带了这个补丁：
+>
+> ```bash
+> cd ~/dsh-our-free-model && git apply <插件目录>/patches/ofm-node20-compat.patch
+> ```
+>
+> 补丁把该导出缺失时降级成 no-op（这些对象在 standalone 里从不过 worker 边界，语义等价）。
+> `22.10+` 不需要打；插件会自己判断：Node < 22.10 且仓库没打补丁时，`/ofm doctor` 与启动失败原因里
+> 会直接给出上面这条命令，而不是让 JS 抛错。
 
 ```bash
 # 唯一的安装动作：把整目录放进 AstrBot 插件目录，然后重启 AstrBot
@@ -429,7 +442,11 @@ req.model = "combo:recommended-free(deep)"   # 尾缀形式
    （standalone 运行期零第三方依赖，所以不需要安装依赖）。找不到时只降级，不改配置，`/ofm doctor` 说明原因。
 11. **只停自己拉起的进程**：PID 记在 KV 里（`owned=true`）。你手动 `npm run start:standalone` 起的服务，
    `/ofm stop` 不会碰，插件卸载时也不会停。
-12. 模型目录缓存 `models_ttl`（默认 600 秒）。改过 OFM 配置后想立刻看到新目录，重启插件或等缓存过期。
+12. 模型目录缓存 `models_ttl`（默认 600 秒）。
+13. **Node 兼容是补丁级的，不是上游支持**：Node < 22.10 依赖 `patches/ofm-node20-compat.patch`。
+    上游若重新生成 `packages/standalone/channels/business.mjs`（构建产物），补丁会丢，需要重打。
+14. 上游免费渠道本身不稳：实测同一时刻 `beam-free` 403 地区限制、`mimo-v2.6-flash-free` 等 429 限流，
+    只有 `kilo-auto/free` 能稳定回话。这是上游账号/出口的问题，与本地部署无关。改过 OFM 配置后想立刻看到新目录，重启插件或等缓存过期。
 
 ---
 
@@ -447,7 +464,7 @@ req.model = "combo:recommended-free(deep)"   # 尾缀形式
 | 对话里模型没变成你选的那个 | 会话覆盖没生效 / 别的会话 | `/ofm status` 看「本会话覆盖」；覆盖按 `unified_msg_origin` 隔离，群聊与私聊互不影响 |
 | `/ofm doctor` 的「自动接入」块全 ✘ | 拿不到 `ProviderManager`（宿主版本不兼容）或 `auto_provision` 关着 | 升级 AstrBot 到 `>=4.13.0,<5`；或打开 `auto_provision`；或按第 5 节手工建提供商 |
 | 日志 `[ofm] 自动接入未完成：…` | OFM 还没起来 / 还没打开本地转发（没有 forwardKey）/ 端口漂移 | OFM 起来后等下一轮对话自愈（300 秒一次），或直接 `/ofm provision` |
-| 日志说 `没能启动 OFM standalone：没找到 node` / `node 版本不满足` | `node -v` 看版本；OFM 要 `^22.19` 或 `>=24` |
+| 启动报 `webidl.util.markAsUncloneable is not a function` | 用 Node 20 但没打补丁：`cd ~/dsh-our-free-model && git apply <插件目录>/patches/ofm-node20-compat.patch` |
 | 日志说 `没找到 Our Free Model 仓库` | 把仓库放到 `~/dsh-our-free-model`，或配 `ofm_root` / 环境变量 `OFM_REPO` |
 | `/ofm doctor` 里「独立服务开关」是 ✘ | `/v1` 会被 503；重跑 `/ofm provision` 让插件打开它，或在 OFM 设置里勾上 |
 | 想把插件装的入口全清掉 | 换 provider / 迁机器 | `/ofm unprovision`（会同时把 `auto_provision` 关掉并落盘，重启不会自己装回来） |

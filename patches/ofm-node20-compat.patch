@@ -1,0 +1,30 @@
+diff --git a/packages/standalone/channels/business.mjs b/packages/standalone/channels/business.mjs
+index cce4ef9..a59475d 100644
+--- a/packages/standalone/channels/business.mjs
++++ b/packages/standalone/channels/business.mjs
+@@ -4300,6 +4300,10 @@ var require_webidl = __commonJS({
+     var assert = __require("node:assert");
+     var { types, inspect } = __require("node:util");
+     var { markAsUncloneable } = __require("node:worker_threads");
++    // [node20-compat] markAsUncloneable is only exported by node:worker_threads on Node >= 22.10.
++    // On Node 20 the destructure yields undefined and every webidl.util.markAsUncloneable(this)
++    // call throws; standalone never posts these objects to a worker, so a no-op is equivalent.
++    if (typeof markAsUncloneable !== "function") { markAsUncloneable = function () {}; }
+     var UNDEFINED = 1;
+     var BOOLEAN = 2;
+     var STRING = 3;
+diff --git a/vendor/channel-pack/pack.js b/vendor/channel-pack/pack.js
+index c9b96c0..06b8abc 100644
+--- a/vendor/channel-pack/pack.js
++++ b/vendor/channel-pack/pack.js
+@@ -4298,6 +4298,10 @@ var require_webidl = __commonJS({
+     var assert = __require("node:assert");
+     var { types, inspect } = __require("node:util");
+     var { markAsUncloneable } = __require("node:worker_threads");
++    // [node20-compat] markAsUncloneable only exists in node:worker_threads on Node >= 22.10.
++    // On Node 20 it is undefined, and every webidl.util.markAsUncloneable(this) call would throw.
++    // These objects never cross a worker boundary in standalone, so a no-op is equivalent.
++    if (typeof markAsUncloneable !== "function") { markAsUncloneable = function () {}; }
+     var UNDEFINED = 1;
+     var BOOLEAN = 2;
+     var STRING = 3;

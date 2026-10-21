@@ -40,6 +40,13 @@ KV_SERVICE = "svc_process"
 MIN_NODE_22 = (22, 19, 0)
 MAX_NODE_22_EXCLUSIVE = (23, 0, 0)
 MIN_NODE_24 = (24, 0, 0)
+# 上游 engines 写的是 ``^22.19.0 || >=24.0.0``，但实测 Node 20 只卡在一个 API 上
+# （node:worker_threads 的 markAsUncloneable 是 22.10 才有的导出）。
+# 打上 patches/ofm-node20-compat.patch 后 20.19 起即可用，AstrBot 的安装脚本给的正是 20.x。
+MIN_NODE_20 = (20, 19, 0)
+NODE_20_PATCH_FROM = (22, 10, 0)  # 低于这个版本才需要补丁
+NODE_20_PATCH_MARK = "node20-compat"
+PATCH_BUNDLE = "packages/standalone/channels/business.mjs"
 
 DEFAULT_START_PORT = 18900
 LOG_TAIL_LINES = 12
@@ -133,12 +140,29 @@ async def node_version(node: str) -> tuple[tuple[int, int, int] | None, str]:
 
 
 def version_ok(version: tuple[int, int, int] | None) -> bool:
-    """``engines`` 是 ``^22.19.0 || >=24.0.0``：22.19 起算到 23.0 之前，或 24+。"""
+    """能不能跑 OFM。
+
+    上游 ``engines`` 是 ``^22.19.0 || >=24.0.0``；实测把唯一一处 Node 22 专有 API
+    （``markAsUncloneable``）兼容掉之后，Node 20.19 起也能跑，而这正是 AstrBot 装机脚本
+    给到的版本，所以下限放到 20.19 —— 低于 22.10 的版本由 :func:`needs_compat_patch` 要求打补丁。
+    """
     if version is None:
         return False
-    if version >= MIN_NODE_24:
-        return True
-    return MIN_NODE_22 <= version < MAX_NODE_22_EXCLUSIVE
+    return version >= MIN_NODE_20
+
+
+def needs_compat_patch(version: tuple[int, int, int] | None) -> bool:
+    """低于 22.10 的 Node 必须给 OFM 打 Node20 兼容补丁。"""
+    return version is not None and MIN_NODE_20 <= version < NODE_20_PATCH_FROM
+
+
+def has_compat_patch(repo: Path) -> bool:
+    """仓库里的 standalone 渠道包是否已带 Node20 兼容补丁。"""
+    try:
+        text = (repo / PATCH_BUNDLE).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return NODE_20_PATCH_MARK in text
 
 
 # ---------------------------------------------------------------------------
@@ -256,11 +280,24 @@ async def start(
     if not version_ok(version):
         return StartResult(
             ok=False,
-            reason=f"node 版本不满足 OFM 要求（需要 ^22.19.0 或 >=24，当前 {raw or '未知'}）",
+            reason=(
+                f"node 版本太旧（{raw or '未知'}）：OFM standalone 需要 Node >= 20.19"
+                "（20.19–22.9 需要额外打 Node20 兼容补丁）"
+            ),
         )
 
     if not is_repo(repo):
         return StartResult(ok=False, reason=f"OFM 仓库不完整：{repo} 里没有 {CLI_REL}")
+
+    if needs_compat_patch(version) and not has_compat_patch(Path(repo)):
+        return StartResult(
+            ok=False,
+            reason=(
+                f"node {raw} 需要 OFM 的 Node20 兼容补丁（否则启动会报 "
+                "webidl.util.markAsUncloneable is not a function）："
+                f"cd {repo} && git apply <插件目录>/patches/ofm-node20-compat.patch"
+            ),
+        )
 
     log_tail: deque[str] = deque(maxlen=LOG_TAIL_LINES)
     try:

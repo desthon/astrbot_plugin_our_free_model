@@ -52,23 +52,91 @@ def test_candidate_roots_prefers_explicit_and_env(tmp_path, monkeypatch):
 @pytest.mark.parametrize(
     "version,expected",
     [
-        ((22, 18, 0), False),
+        ((20, 18, 0), False),
+        ((20, 19, 0), True),  # AstrBot 装机脚本给的就是这一档
+        ((20, 19, 2), True),
+        ((22, 18, 0), True),
         ((22, 19, 0), True),
-        ((23, 9, 9), False),
+        ((23, 9, 9), True),
         ((24, 0, 0), True),
         ((25, 3, 1), True),
         (None, False),
     ],
 )
-def test_version_ok_matches_engines(version, expected):
-    """engines 是 ``^22.19.0 || >=24.0.0``：23.x 整段不满足。"""
+def test_version_ok_accepts_the_node_astrbot_ships(version, expected):
+    """上游 engines 是 ``^22.19 || >=24``，但兼容补丁后 Node 20.19 起也能跑。"""
 
     assert _sup().version_ok(version) is expected
+
+
+@pytest.mark.parametrize(
+    "version,expected",
+    [
+        ((20, 19, 2), True),
+        ((22, 9, 0), True),
+        ((22, 10, 0), False),  # 22.10 起原生就有 markAsUncloneable
+        ((24, 0, 0), False),
+    ],
+)
+def test_needs_compat_patch_only_below_22_10(version, expected):
+    assert _sup().needs_compat_patch(version) is expected
+
+
+def test_start_refuses_old_node_without_patch(tmp_path, monkeypatch):
+    """Node 20 且仓库没打补丁时，要在启动前给可执行的指令而不是让 JS 抛错。"""
+    sup = _sup()
+    repo = _repo(tmp_path)
+    monkeypatch.setattr(sup, "which_node", lambda: "/usr/bin/node")
+    monkeypatch.setattr(sup, "probe_health", _never_up)
+
+    async def fake_version(node):
+        return (20, 19, 2), "v20.19.2"
+
+    monkeypatch.setattr(sup, "node_version", fake_version)
+
+    result = helpers._run(sup.start(repo, port=18900))
+
+    assert result.ok is False
+    assert "补丁" in (result.reason or ""), result.reason
+    assert "ofm-node20-compat.patch" in (result.reason or "")
+    assert result.started is False
+
+
+def test_start_accepts_old_node_with_patch(tmp_path, monkeypatch):
+    """补丁在位时 Node 20 不应被拦（真正的起进程交给下游，这里只验闸门）。"""
+    sup = _sup()
+    repo = _repo(tmp_path)
+    bundle = repo / "packages" / "standalone" / "channels" / "business.mjs"
+    bundle.parent.mkdir(parents=True)
+    bundle.write_text("// node20-compat applied\n", encoding="utf-8")
+    monkeypatch.setattr(sup, "which_node", lambda: "/usr/bin/node")
+    monkeypatch.setattr(sup, "probe_health", _never_up)
+
+    async def fake_version(node):
+        return (20, 19, 2), "v20.19.2"
+
+    async def fake_exec(*a, **kw):
+        raise RuntimeError("不真的起进程")
+
+    monkeypatch.setattr(sup, "node_version", fake_version)
+    monkeypatch.setattr(sup.asyncio, "create_subprocess_exec", fake_exec)
+
+    result = helpers._run(sup.start(repo, port=18900))
+
+    assert "补丁" not in (result.reason or ""), result.reason
 
 
 # ---------------------------------------------------------------------------
 # start() 的降级分支
 # ---------------------------------------------------------------------------
+def _repo(tmp_path) -> "Path":
+    """一个最小的「看起来像 OFM 仓库」的目录（有 cli.mjs）。"""
+    repo = tmp_path / "ofm"
+    (repo / "packages" / "standalone").mkdir(parents=True)
+    (repo / "packages" / "standalone" / "cli.mjs").write_text("// cli\n", encoding="utf-8")
+    return repo
+
+
 def test_start_without_node_reports_actionable_reason(tmp_path, monkeypatch):
     sup = _sup()
     repo = tmp_path / "ofm"
