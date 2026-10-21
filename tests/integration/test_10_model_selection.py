@@ -162,3 +162,65 @@ def test_model_selection_is_deterministic(environment):
     assert support.require_updated_model(second) is False, (
         "model 仍在目录里且未变化时不应报告 updated_model=True（否则每次 ensure 都改配置）"
     )
+
+
+# ---------------------------------------------------------------------------
+# 规则 1：配置项 default_model 命中目录时优先于 combo:recommended-free
+# ---------------------------------------------------------------------------
+def test_configured_default_model_wins_when_present(environment):
+    env = environment
+    env.gateway.set_models(
+        [model_row(COMBO, ["light", "balanced"]), model_row("combo:custom-free"), model_row(FALLBACK)]
+    )
+    env.plugin.config["default_model"] = "combo:custom-free"
+
+    result = support.run(env.provision.ensure(env.plugin, env.endpoint()))
+
+    assert result.ok is True, f"ensure 失败：{result.degraded_reason!r}"
+    assert result.model == "combo:custom-free", (
+        "配置项 default_model 命中目录时必须优先使用它（规则 1），实际选了 "
+        f"{result.model!r}（目录里同时有 {COMBO!r}）"
+    )
+    assert env.managed_provider()["model"] == "combo:custom-free"
+    assert getattr(result, "model_source", None) == "配置", (
+        f"来源应标为「配置」，实际 {getattr(result, 'model_source', 'MISSING')!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# doctor 可见性：/ofm doctor 的「自动接入」块要显示 model 与来源
+# ---------------------------------------------------------------------------
+def test_doctor_reports_verified_model_source(environment):
+    env = environment
+    # 目录里没有 default_model 的默认值(combo:recommended-free)，命中规则 3：第一个 combo:*
+    env.gateway.set_models([model_row("combo:other-free", ["light", "balanced"]), model_row(FALLBACK)])
+
+    result = support.drive_plugin_provision(env.plugin)
+    assert result is not None and result.ok is True, f"接入失败：{result!r}"
+
+    label, evidence = support.doctor_model_source(env.plugin, env.provision, result)
+    assert result.model == "combo:other-free", (
+        f"前置条件：应命中规则 3（第一个 combo:*），实际 {result.model!r}"
+    )
+    assert label == "组合", (
+        "doctor 的「自动接入」块必须显示 model 来源；按规则 3 选中的 combo:other-free 应标为「组合」。"
+        "在 inspect_state / 接入详情 / provision_last 里都没找到来源标签。\n"
+        f"观测面：\n{evidence}"
+    )
+    assert "combo:other-free" in evidence, (
+        "doctor 块还应显示实际选中的 model（combo:other-free）\n观测面：\n" + evidence
+    )
+
+
+def test_doctor_reports_unverified_model_source(environment):
+    env = environment
+    env.gateway.models_status = 500
+
+    result = support.drive_plugin_provision(env.plugin)
+    assert result is not None and result.ok is True, f"目录不可用不应导致接入失败：{result!r}"
+
+    label, evidence = support.doctor_model_source(env.plugin, env.provision, result)
+    assert label == "未校验", (
+        "目录拉不到时 doctor 必须显示「未校验」来源，而不是静默显示一个没验证过的 model。\n"
+        f"观测面：\n{evidence}"
+    )

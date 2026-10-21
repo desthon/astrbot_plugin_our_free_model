@@ -670,3 +670,63 @@ def provision_annotation_surfaces(plugin, provision_module, result=None) -> dict
         surfaces["KV provision_last"] = f"<error {type(exc).__name__}: {exc}>"
 
     return surfaces
+
+
+MODEL_SOURCE_LABELS = ("配置", "组合", "免费", "兜底", "未校验")
+
+
+def _labels_in_dict(value: Any, hits: list[tuple[str, str]], path: str = "") -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _labels_in_dict(item, hits, f"{path}.{key}" if path else str(key))
+    elif isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            _labels_in_dict(item, hits, f"{path}[{index}]")
+    elif isinstance(value, str) and value in MODEL_SOURCE_LABELS:
+        hits.append((path, value))
+
+
+def doctor_model_source(plugin, provision_module, result=None) -> tuple[str | None, str]:
+    """The model-source label as the **doctor block** can see it.
+
+    F1 requires ``/ofm doctor`` to show the selected model **and its source**
+    (配置 / 组合 / 免费 / 兜底 / 未校验). ``ProvisionResult`` alone does not count:
+    doctor renders persisted/inspected state, so the label has to survive in
+    ``inspect_state()``, the provision detail text, or the ``provision_last`` KV.
+
+    Returns ``(label, evidence)``; ``label`` is ``None`` when no surface carries
+    it, and ``evidence`` is a readable dump for the failure message.
+    """
+
+    import re
+
+    surfaces = provision_annotation_surfaces(plugin, provision_module, result)
+    # doctor 读的是持久化/可查看的状态，读不到内存里的这个 result 对象本身
+    surfaces.pop("ProvisionResult", None)
+    hits: list[tuple[str, str]] = []
+    for name, text in surfaces.items():
+        # dict-shaped dumps are JSON strings; reparse so keys keep their names
+        try:
+            parsed = json.loads(text)
+        except (TypeError, ValueError):
+            parsed = None
+        if parsed is not None:
+            found: list[tuple[str, str]] = []
+            _labels_in_dict(parsed, found, name)
+            hits.extend(found)
+        pattern = re.search(
+            r"(?:来源|模型来源|来自)[：: ]*(" + "|".join(MODEL_SOURCE_LABELS) + ")",
+            text,
+        )
+        if pattern:
+            hits.append((f"{name}:来源标注", pattern.group(1)))
+
+    evidence = "\n".join(f"[{name}] {text[:240]}" for name, text in surfaces.items())
+    if result is not None:
+        evidence += "\n[ProvisionResult] " + json.dumps(
+            {k: v for k, v in getattr(result, "__dict__", {}).items() if k in ("model", "model_source", "note")},
+            ensure_ascii=False,
+        )
+    for path, label in hits:
+        return label, f"{path} = {label!r}\n{evidence}"
+    return None, evidence

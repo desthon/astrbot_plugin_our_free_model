@@ -51,6 +51,8 @@ _PROVISION_KV = "provision_last"
 #: 自愈重试间隔（秒）与次数上限
 _PROVISION_RETRY_INTERVAL = 300.0
 _PROVISION_MAX_RETRIES = 3
+#: 失败次数用尽后不再每 300 秒重试，改成每 30 分钟试一次（进程内仍会自动恢复）
+_PROVISION_SLOW_RETRY_INTERVAL = 1800.0
 #: 端点解析的硬超时（秒）：启动钩子里不许久等
 _PROVISION_RESOLVE_TIMEOUT = 3.0
 
@@ -299,6 +301,22 @@ class OurFreeModel(Star):
             return value.strip().lower() in ("1", "true", "yes", "on")
         return bool(value)
 
+    async def _persist_auto_provision(self, value: bool) -> str:
+        """把 ``auto_provision`` 写回插件配置，返回给用户的一句话（失败也不抛）。"""
+        conf = getattr(self, "config", None)
+        if conf is None or not hasattr(conf, "__setitem__"):
+            return "配置对象不可用，没能写回 auto_provision"
+        try:
+            conf["auto_provision"] = bool(value)
+            save = getattr(conf, "save_config", None)
+            if callable(save):
+                await SessionStore._maybe_await(save())
+            return f"已把 auto_provision 写回 {str(bool(value)).lower()}（重启后仍然生效）"
+        except Exception as exc:  # 磁盘只读之类的极端情况
+            log = getattr(self, "logger", logger)
+            log.warning(f"[ofm] 写回 auto_provision 失败（已忽略）：{exc}")
+            return f"写回 auto_provision 失败：{exc}（本次会话内仍然按你的操作生效）"
+
     def _managed_model(self) -> str:
         """托管 provider 用的模型名（复用 ``default_model``）。"""
         text = str(self._cfg("default_model", provision.DEFAULT_MODEL) or "").strip()
@@ -352,6 +370,10 @@ class OurFreeModel(Star):
         if not parts:
             parts.append("配置已是最新，无需改动")
         parts.append(f"model={result.model}")
+        if result.model_source:
+            parts.append(f"来源：{result.model_source}")
+        if result.note:
+            parts.append(result.note)
         return "、".join(parts)
 
     async def _remember_provision(
@@ -361,6 +383,7 @@ class OurFreeModel(Star):
         *,
         endpoint: Endpoint | None = None,
         model: str = "",
+        model_source: str = "",
     ) -> None:
         """把接入结果写进 KV。``checked_at`` 是端点复检的节流依据（跨重启有效）。"""
         previous = self._provision_last if isinstance(self._provision_last, dict) else {}
@@ -377,6 +400,9 @@ class OurFreeModel(Star):
         chosen = model or str(previous.get("model") or "")
         if chosen:
             payload["model"] = chosen
+        source = model_source or str(previous.get("model_source") or "")
+        if source:
+            payload["model_source"] = source
         self._provision_last = payload
         await self._kv_put(_PROVISION_KV, payload)
 
@@ -437,6 +463,7 @@ class OurFreeModel(Star):
             self._describe_provision(result),
             endpoint=endpoint,
             model=result.model,
+            model_source=result.model_source,
         )
         return result
 
@@ -450,9 +477,12 @@ class OurFreeModel(Star):
             return
         last = self._provision_last
         ok_before = isinstance(last, dict) and bool(last.get("ok"))
-        if not ok_before and self._provision_failures >= _PROVISION_MAX_RETRIES:
-            return
-        if self._within_retry_window():
+        exhausted = not ok_before and self._provision_failures >= _PROVISION_MAX_RETRIES
+        if exhausted:
+            # 上限用尽不等于永久放弃：降到每 30 分钟一次，OFM 起来后仍然能自愈
+            if (time.time() - self._last_checked_at()) < _PROVISION_SLOW_RETRY_INTERVAL:
+                return
+        elif self._within_retry_window():
             return
         task = self._provision_task
         if task is not None and not task.done():
@@ -484,6 +514,7 @@ class OurFreeModel(Star):
                 str(last.get("detail") or "自动接入正常"),
                 endpoint=endpoint,
                 model=str(last.get("model") or ""),
+                model_source=str(last.get("model_source") or ""),
             )
             return
         result = await provision.ensure(self, endpoint, model=self._managed_model())
@@ -496,6 +527,7 @@ class OurFreeModel(Star):
             self._describe_provision(result),
             endpoint=endpoint,
             model=result.model,
+            model_source=result.model_source,
         )
         log = getattr(self, "logger", logger)
         if result.ok:
@@ -963,13 +995,26 @@ class OurFreeModel(Star):
                 )
             )
             if state["model"]:
+                # 来源优先取上次 ensure 落盘的那一个（目录拉不到时会记成「未校验」，
+                # 只凭模型名反推不出来）；没记录时才按名字推。
+                recorded = await self._kv_get(_PROVISION_KV, None)
+                recorded_source = ""
+                if isinstance(recorded, dict) and str(recorded.get("model") or "") == state["model"]:
+                    recorded_source = str(recorded.get("model_source") or "")
+                source_label = recorded_source or provision.model_source(
+                    state["model"], self._managed_model()
+                )
+                note = ""
+                if isinstance(recorded, dict) and str(recorded.get("model") or "") == state["model"]:
+                    note = str(recorded.get("note") or "")
                 lines.append(
                     mark(
-                        True,
+                        source_label != provision.MODEL_SOURCE_UNVERIFIED,
                         "托管模型",
-                        f"{state['model']}（来源："
-                        f"{provision.model_source(state['model'], self._managed_model())}）",
-                        "网关目录里没有这个模型时，/ofm provision 会按目录重选（配置项 default_model 优先）。",
+                        f"{state['model']}（来源：{source_label}"
+                        + (f"，{note}" if note else "")
+                        + "）",
+                        "未校验 = 当时拉不到 /v1/models，按配置值接入；网关恢复后 /ofm provision 会按目录重选。",
                     )
                 )
             default_id = state["default_provider_id"]
@@ -1234,6 +1279,10 @@ class OurFreeModel(Star):
             lines.append("· 全局默认模型：没动（已有默认，或你在 WebUI / 会话里显式选过）")
         if result.ok:
             lines.append("· 实例：已加载，直接对话即可")
+            if not self._auto_provision():
+                # 手动跑通一次 = 明确的「我要它」意图：把 opt-out 撤销，避免下次重启又掉
+                lines.append(f"· {await self._persist_auto_provision(True)}")
+                self._provision_failures = 0
         else:
             lines.append(f"· 降级原因：{result.degraded_reason}")
             lines.append("  → 修完重跑 /ofm provision；要看全貌用 /ofm doctor。")
@@ -1247,11 +1296,19 @@ class OurFreeModel(Star):
         """删掉两个托管条目；默认 provider_id 是本插件设的就清空。"""
         before = provision.inspect_state(self)
         changed = await provision.teardown(self)
+        # 无论这次有没有东西可拆，「别再自动装回来」这个意图都要落盘
+        self._provision_failures = _PROVISION_MAX_RETRIES
+        note = await self._persist_auto_provision(False)
+        await self._remember_provision(
+            False, "已手动 unprovision；auto_provision 已关，不再自动重试"
+        )
         if not changed:
             await self._send(
                 event,
                 "没有需要清理的东西：配置里没有 ofm-standalone / ofm-free，"
-                "全局默认模型也不是本插件设的。",
+                "全局默认模型也不是本插件设的。\n"
+                f"· {note}\n"
+                "· 想接入就 /ofm provision（会同时把 auto_provision 打开）。",
             )
             return
         lines = ["已清理自动接入："]
@@ -1264,13 +1321,8 @@ class OurFreeModel(Star):
         if before["default_is_ours"]:
             lines.append("· 全局默认模型 provider_id 已清空（它原本指向被删掉的 provider）")
         lines.append("")
-        lines.append(
-            "说明：auto_provision 仍开着，下次 AstrBot 重启会重新接入；"
-            "要长期关掉请把配置里的 auto_provision 关掉。"
-        )
-        # 用户是主动拆的：本进程内不要再自愈把它装回来
-        self._provision_failures = _PROVISION_MAX_RETRIES
-        await self._remember_provision(False, "已手动 unprovision；本进程内不再自动重试")
+        lines.append(f"· {note}")
+        lines.append("· 想重新接入：/ofm provision（会同时把 auto_provision 打开）")
         await self._send(event, "\n".join(lines))
 
     # ---- /ofm announce ----------------------------------------------------

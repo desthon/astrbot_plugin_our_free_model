@@ -83,7 +83,7 @@ OFM_HOME=/srv/our-free-model python3 main.py   # 或写进 systemd service 的 E
   （否则每一轮对话都会撞在坏 provider 上）；
 * **幂等**：第二次运行不重复建条目、不改没变化的字段（真实保存次数不增加）。
 
-清理：`/ofm unprovision` 删掉上面两个托管条目；如果默认值是本插件设的，会顺带清空 `provider_id`。
+清理：`/ofm unprovision` 删掉上面两个托管条目；如果默认值是本插件设的，会顺带清空 `provider_id`。它同时会把 `auto_provision` 写回 `false`（即「别再自动装回来」），所以重启后不会重新接入；想恢复就 `/ofm provision`，它会重新把开关打开。
 手工清理等价于在 WebUI 的提供商页删掉 `ofm-standalone` 与 `ofm-free`，再把 `agent_runner.config.model.provider_id` 置空。
 
 想彻底不要这套行为：把插件配置里的 `auto_provision` 关掉（见下一节）。
@@ -97,7 +97,7 @@ AstrBot 先起来、OFM 后起来是常见顺序（尤其 systemd 里两个服�
 1. 启动钩子会因为「连不上网关」降级，只写一行 `logger.warning`，**不阻塞启动、不影响其他插件**；
 2. 之后每条消息经过 `on_llm_request` 时检查一次：上次失败 / 没有记录、且距上次尝试超过 **300 秒**、且 `auto_provision` 开着，
    就 `asyncio.create_task` 丢一个后台重试（**不 await**，这条消息照常回），失败只更新 KV，不给你发消息打扰；
-3. 最多重试 **3 次**；成功则日志一行 `[ofm] 自动接入已恢复`，并把默认模型按需接管；
+3. 前 **3 次**按 300 秒间隔重试；用尽后**不是永久放弃**，降到每 **30 分钟**试一次（OFM 隔几小时才起来也照样能自愈）；成功则日志一行 `[ofm] 自动接入已恢复`，并把默认模型按需接管；
 4. 不想等：OFM 起来后直接敲 `/ofm provision`，立刻重跑一次（`auto_provision` 关着也照跑）。
 
 **已经接入成功之后 OFM 换了端口**（被占用时 OFM 会顺延端口，`standalonePort` 会变）：成功以后同样每 **300 秒**
@@ -396,7 +396,7 @@ req.model = "combo:recommended-free(deep)"   # 尾缀形式
 | 对话里模型没变成你选的那个 | 会话覆盖没生效 / 别的会话 | `/ofm status` 看「本会话覆盖」；覆盖按 `unified_msg_origin` 隔离，群聊与私聊互不影响 |
 | `/ofm doctor` 的「自动接入」块全 ✘ | 拿不到 `ProviderManager`（宿主版本不兼容）或 `auto_provision` 关着 | 升级 AstrBot 到 `>=4.13.0,<5`；或打开 `auto_provision`；或按第 5 节手工建提供商 |
 | 日志 `[ofm] 自动接入未完成：…` | OFM 还没起来 / 还没打开本地转发（没有 forwardKey）/ 端口漂移 | OFM 起来后等下一轮对话自愈（300 秒一次），或直接 `/ofm provision` |
-| 想把插件装的入口全清掉 | 换 provider / 迁机器 | `/ofm unprovision`；随后如需长期关闭自动接入，把 `auto_provision` 关掉 |
+| 想把插件装的入口全清掉 | 换 provider / 迁机器 | `/ofm unprovision`（会同时把 `auto_provision` 关掉并落盘，重启不会自己装回来） |
 | 插件加载失败 | Python 版本或 AstrBot 版本不满足 | 需要 Python 3.12+、AstrBot `>=4.13.0,<5` |
 
 ## 仓库名与插件目录名
